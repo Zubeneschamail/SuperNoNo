@@ -163,6 +163,8 @@ const CODEX_STATUS_MOTIONS = {
   error: 'Failed',
   blocked: 'Nope'
 };
+const MOUSE_FOLLOW_POSE_SOURCES = new Set(['mouse-follow', 'mouse-follow-throw']);
+const THROW_POSE_SOURCE = 'mouse-follow-throw';
 
 const stageElement = document.querySelector('#stage');
 const statusElement = document.querySelector('#status');
@@ -179,7 +181,8 @@ let idleTimeoutId = 0;
 let motionRunId = 0;
 let motionActive = false;
 let roamPoseActive = false;
-let roamPoseDirection = { dx: 0, dy: 0, progress: 0 };
+let roamPoseSource = 'roam';
+let roamPoseDirection = { dx: 0, dy: 0, progress: 0, speed: 0, source: 'roam' };
 let dragPoseActive = false;
 let dragPose = { clientX: 0, clientY: 0, dx: 0, dy: 0, distance: 0, durationMs: 0 };
 let codexStatusActive = false;
@@ -494,6 +497,10 @@ function focusCenter() {
   model.focus(app.screen.width / 2, app.screen.height / 2);
 }
 
+function isMouseFollowPoseActive() {
+  return roamPoseActive && MOUSE_FOLLOW_POSE_SOURCES.has(roamPoseSource);
+}
+
 function setRoamPose(pose) {
   const active = Boolean(pose?.active);
   if (!active || !model || !app) {
@@ -501,7 +508,12 @@ function setRoamPose(pose) {
     return;
   }
 
-  if (isCodexThinkingState() && !codexThinkingInterrupted) {
+  const source = String(pose?.source ?? 'roam');
+  if (MOUSE_FOLLOW_POSE_SOURCES.has(source)) {
+    markInteraction();
+  }
+
+  if (!MOUSE_FOLLOW_POSE_SOURCES.has(source) && isCodexThinkingState() && !codexThinkingInterrupted) {
     resetRoamPose();
     return;
   }
@@ -515,16 +527,20 @@ function setRoamPose(pose) {
   }
 
   roamPoseActive = true;
+  roamPoseSource = source;
   roamPoseDirection = {
     dx: dx / length,
     dy: dy / length,
-    progress: clamp(Number(pose.progress) || 0, 0, 1)
+    progress: clamp(Number(pose.progress) || 0, 0, 1),
+    speed: length,
+    source
   };
 }
 
 function resetRoamPose() {
   roamPoseActive = false;
-  roamPoseDirection = { dx: 0, dy: 0, progress: 0 };
+  roamPoseSource = 'roam';
+  roamPoseDirection = { dx: 0, dy: 0, progress: 0, speed: 0, source: 'roam' };
   resetRoamParameters();
   focusCenter();
 }
@@ -535,28 +551,77 @@ function resetRoamParameters() {
   }
 }
 
+function applyMovementAppendagePose({
+  directionX,
+  directionY,
+  speedPressure,
+  activity,
+  phase,
+  now,
+  dragPullX = 0,
+  dragPullY = 0,
+  source = 'roam'
+}) {
+  const fast = clamp(speedPressure, 0, 1);
+  const load = clamp(activity, 0, 1.35);
+  const lateral = clamp(directionX + dragPullX * 0.24, -1, 1);
+  const vertical = clamp(directionY + dragPullY * 0.18, -1, 1);
+  const throwBoost = source === THROW_POSE_SOURCE ? 1.22 : 1;
+  const flapRate = 2.35 + fast * 5.2 + (source === THROW_POSE_SOURCE ? 2.2 : 0);
+  const flap = Math.sin(now * flapRate + phase * Math.PI * 2);
+  const counterFlap = Math.sin(now * (flapRate * 0.72) + phase * Math.PI * 2 + 1.7);
+  const tremble = Math.sin(now * (8.5 + fast * 13.5) + phase * 5.1) * fast;
+  const lift = -vertical;
+  const windLoad = load * throwBoost;
+  const earTuck = (-4.5 - fast * 8.5 + Math.max(0, vertical) * 3.5) * windLoad;
+  const earSpread = lateral * (7 + fast * 6) * windLoad;
+  const earFlutter = (flap * (2.3 + fast * 4.4) + tremble * 2.1) * windLoad;
+  const earVertical = (lift * (8.5 + fast * 5.5) + counterFlap * (2 + fast * 3.2)) * windLoad;
+
+  setParameter('Param19', clamp(earTuck - earSpread + earFlutter, -30, 18));
+  setParameter('Param28', clamp(earTuck + earSpread - earFlutter * 0.92, -30, 18));
+  setParameter('Param29', clamp(earVertical, -24, 24));
+
+  const wingBase = (5.5 + fast * 6.5 - vertical * 4.2) * windLoad;
+  const wingFlap = (flap * (5.5 + fast * 9.5) + tremble * 3.6) * windLoad;
+  const wingBank = lateral * (8 + fast * 9) * windLoad;
+  const wingLift = (lift * (9.5 + fast * 8.5) + counterFlap * (4 + fast * 5.5)) * windLoad;
+  const trailingKick = Math.max(0, fast - 0.34) * 11 * windLoad;
+
+  setParameter('Param24', clamp(wingBase + wingLift + wingFlap * 0.36, -30, 30));
+  setParameter('Param22', clamp(-10 - wingBank - wingFlap - trailingKick, -30, 18));
+  setParameter('Param23', clamp(-10 + wingBank + wingFlap * 0.88 - trailingKick * 0.72, -30, 18));
+}
+
 function updateRoamPose() {
   if (!model || !app || !roamPoseActive || motionActive || dragPoseActive) {
     return;
   }
 
-  const { dx, dy, progress } = roamPoseDirection;
+  const { dx, dy, progress, speed, source } = roamPoseDirection;
   const now = performance.now() / 1000;
-  const activity = 0.22 + Math.sin(Math.PI * progress) * 0.78;
-  const flap = Math.sin(now * 2.45 + progress * Math.PI * 2);
-  const smallSway = Math.sin(now * 1.65);
+  const sourceSpeed = source === 'roam'
+    ? clamp(speed / 110, 0, 1)
+    : clamp(speed / (source === THROW_POSE_SOURCE ? 1700 : 1050), 0, 1);
+  const phaseActivity = source === 'roam'
+    ? Math.sin(Math.PI * progress) * 0.45
+    : progress * 0.72;
+  const activity = clamp(0.22 + phaseActivity + sourceSpeed * 0.62, 0.18, 1.28);
 
   model.focus(
-    app.screen.width * (0.5 + dx * 0.3),
-    app.screen.height * (0.5 + dy * 0.24)
+    app.screen.width * (0.5 + dx * (0.22 + sourceSpeed * 0.14)),
+    app.screen.height * (0.5 + dy * (0.18 + sourceSpeed * 0.12))
   );
 
-  setParameter('Param19', clamp((-5 - dx * 4 + flap * 1.4) * activity, -13, 10));
-  setParameter('Param28', clamp((-5 + dx * 4 - flap * 1.4) * activity, -13, 10));
-  setParameter('Param29', clamp((-dy * 7 + smallSway * 2) * activity, -11, 11));
-  setParameter('Param24', clamp((4 - dy * 5 + flap * 3) * activity, -10, 14));
-  setParameter('Param22', clamp((-7 - dx * 5 + flap * 2.5) * activity, -17, 8));
-  setParameter('Param23', clamp((-7 + dx * 5 - flap * 2.5) * activity, -17, 8));
+  applyMovementAppendagePose({
+    directionX: dx,
+    directionY: dy,
+    speedPressure: sourceSpeed,
+    activity,
+    phase: progress,
+    now,
+    source
+  });
 }
 
 function setDragPose(pose) {
@@ -615,9 +680,9 @@ function updateDragPose() {
   const directionY = speedLength > 0.001 ? dragPose.dy / speedLength : -0.3;
   const pullX = clamp((dragPose.clientX / Math.max(1, app.screen.width) - 0.5) * 2, -1, 1);
   const pullY = clamp((dragPose.clientY / Math.max(1, app.screen.height) - 0.5) * 2, -1, 1);
-  const activity = clamp(0.38 + dragPose.distance / 110, 0.38, 1);
-  const wiggle = Math.sin(now * 6.2) * activity;
-  const hover = Math.sin(now * 3.1) * activity;
+  const speedPressure = clamp(speedLength / 22 + dragPose.distance / 340, 0, 1);
+  const activity = clamp(0.36 + dragPose.distance / 150 + speedPressure * 0.58, 0.36, 1.28);
+  const phase = clamp(dragPose.durationMs / 520, 0, 1);
 
   model.focus(
     app.screen.width * (0.5 + clamp(pullX * 0.26 + directionX * 0.12, -0.38, 0.38)),
@@ -629,12 +694,17 @@ function updateDragPose() {
   setParameter('Param9', 0);
   setParameter('Param10', 0);
   setParameter('Param11', 1);
-  setParameter('Param19', clamp((-11 - directionX * 8 + directionY * 5 + wiggle * 1.8) * activity, -24, 12));
-  setParameter('Param28', clamp((-11 + directionX * 8 + directionY * 5 - wiggle * 1.8) * activity, -24, 12));
-  setParameter('Param29', clamp((-directionY * 13 + hover * 3) * activity, -18, 18));
-  setParameter('Param24', clamp((9 + directionY * 4 + wiggle * 4) * activity, -10, 22));
-  setParameter('Param22', clamp((-13 - directionX * 7 + wiggle * 4) * activity, -26, 10));
-  setParameter('Param23', clamp((-13 + directionX * 7 - wiggle * 4) * activity, -26, 10));
+  applyMovementAppendagePose({
+    directionX,
+    directionY,
+    speedPressure,
+    activity,
+    phase,
+    now,
+    dragPullX: pullX,
+    dragPullY: pullY,
+    source: 'drag'
+  });
 }
 
 function normalizeCodexState(state) {
@@ -730,6 +800,7 @@ function shouldRunCodexThinkingCharge() {
     && isCodexThinkingState()
     && !codexThinkingInterrupted
     && !dragPoseActive
+    && !isMouseFollowPoseActive()
   );
 }
 

@@ -58,6 +58,28 @@ internal sealed class PetForm : Form
     private const int RoamMaxStepY = 58;
     private const int RoamDurationMinMs = 3200;
     private const int RoamDurationMaxMs = 5200;
+    private const int MouseFollowTimerIntervalMs = 8;
+    private const int MouseFollowComfortDistance = 118;
+    private const int MouseFollowPoseStartDistance = 2;
+    private const double MouseFollowSpring = 92.0;
+    private const double MouseFollowDamping = 18.0;
+    private const double MouseFollowMaxSpeed = 1120.0;
+    private const double MouseFollowStopSpeed = 18.0;
+    private const double MouseFollowMinFrameSeconds = 0.001;
+    private const double MouseFollowMaxFrameSeconds = 0.033;
+    private const int MouseFollowThrowLimit = 3;
+    private const int MouseFollowThrowMinDistance = 18;
+    private const int MouseFollowThrowRecentMoveMs = 160;
+    private const double MouseFollowThrowMinSpeed = 880.0;
+    private const double MouseFollowThrowMaxSpeed = 1800.0;
+    private const double MouseFollowThrowAwayDamping = 2.25;
+    private const double MouseFollowThrowAwayMinFinishSpeed = 120.0;
+    private const double MouseFollowThrowAwayMinDurationSeconds = 0.42;
+    private const double MouseFollowThrowAwayMaxDurationSeconds = 0.74;
+    private const double MouseFollowThrowNopeHoldSeconds = 3.55;
+    private const double MouseFollowThrowReturnMinDurationSeconds = 1.05;
+    private const double MouseFollowThrowReturnMaxDurationSeconds = 1.7;
+    private const double MouseFollowThrowReturnDistanceDurationFactor = 560.0;
     private const int CodexStatusTimerIntervalMs = 1000;
     private const int CodexStatusStaleMs = 300000;
     private const string VirtualHost = "desktop-pet.local";
@@ -78,6 +100,14 @@ internal sealed class PetForm : Form
         "reviewing"
     };
 
+    private enum MouseFollowThrowPhase
+    {
+        None,
+        ThrowingAway,
+        Reacting,
+        Returning
+    }
+
     private readonly Icon appIcon = LoadAppIcon();
     private readonly WebView2 webView = new();
     private readonly NotifyIcon trayIcon;
@@ -85,6 +115,7 @@ internal sealed class PetForm : Form
     private readonly ToolStripMenuItem clickThroughMenuItem;
     private readonly ToolStripMenuItem autoMotionMenuItem;
     private readonly ToolStripMenuItem gazeTrackingMenuItem;
+    private readonly ToolStripMenuItem mouseFollowMenuItem;
     private readonly ToolStripMenuItem desktopRoamMenuItem;
     private readonly ToolStripMenuItem codexStatusMenuItem;
     private readonly InputOverlayForm inputOverlay;
@@ -107,10 +138,15 @@ internal sealed class PetForm : Form
     private bool clickThrough;
     private bool autoMotions = true;
     private bool gazeTracking = true;
+    private bool mouseFollow;
     private bool desktopRoam = true;
     private bool codexStatusIntegration = true;
     private bool dragging;
+    private bool inputPointerActive;
     private bool roamAnimating;
+    private bool mouseFollowPoseActive;
+    private bool mouseFollowTimerPrecisionActive;
+    private MouseFollowThrowPhase mouseFollowThrowPhase;
     private Point lastDragScreen;
     private Point webDragStartScreen;
     private DateTime webDragStartedAt;
@@ -119,6 +155,24 @@ internal sealed class PetForm : Form
     private long roamStartedTick;
     private long nextRoamTick;
     private int roamDurationMs;
+    private double mouseFollowX;
+    private double mouseFollowY;
+    private double mouseFollowVelocityX;
+    private double mouseFollowVelocityY;
+    private double mouseFollowThrowVelocityX;
+    private double mouseFollowThrowVelocityY;
+    private double mouseFollowThrowDirectionX;
+    private double mouseFollowThrowDirectionY;
+    private double mouseFollowThrowStartX;
+    private double mouseFollowThrowStartY;
+    private double mouseFollowThrowTargetX;
+    private double mouseFollowThrowTargetY;
+    private double mouseFollowThrowElapsedSeconds;
+    private double mouseFollowThrowDurationSeconds;
+    private int mouseFollowThrowCount;
+    private long mouseFollowLastFrameTick;
+    private int mouseFollowFramePending;
+    private System.Threading.Timer? mouseFollowTimer;
     private long lastUserActivityTick = Environment.TickCount64;
     private bool codexPlayerReady;
     private DateTime codexStatusLastWriteUtc = DateTime.MinValue;
@@ -162,6 +216,12 @@ internal sealed class PetForm : Form
             CheckOnClick = false
         };
         trayMenu.Items.Add(gazeTrackingMenuItem);
+        mouseFollowMenuItem = new ToolStripMenuItem("鼠标追随", null, (_, _) => ToggleMouseFollow())
+        {
+            Checked = mouseFollow,
+            CheckOnClick = false
+        };
+        trayMenu.Items.Add(mouseFollowMenuItem);
         desktopRoamMenuItem = new ToolStripMenuItem("桌面巡游", null, (_, _) => ToggleDesktopRoam())
         {
             Checked = desktopRoam,
@@ -206,6 +266,8 @@ internal sealed class PetForm : Form
         {
             UpdateInputOverlay();
             UpdateGazeTimer();
+            SyncMouseFollowKinematics(resetVelocity: true);
+            UpdateMouseFollowTimer();
             ScheduleNextRoam(Environment.TickCount64, RoamInitialDelayMinMs, RoamInitialDelayMaxMs);
             UpdateDesktopRoamTimer();
             UpdateCodexStatusTimer();
@@ -266,6 +328,7 @@ internal sealed class PetForm : Form
             appIcon.Dispose();
             inputOverlay.Dispose();
             gazeTimer.Dispose();
+            StopMouseFollowTimer();
             roamTimer.Dispose();
             codexStatusTimer.Dispose();
             trayMenu.Dispose();
@@ -431,6 +494,39 @@ internal sealed class PetForm : Form
         ExecutePlayerScript($"window.desktopPet?.setGazeTracking({JsonSerializer.Serialize(gazeTracking)})");
     }
 
+    private void ToggleMouseFollow()
+    {
+        MarkUserActivity();
+        mouseFollow = !mouseFollow;
+        mouseFollowMenuItem.Checked = mouseFollow;
+        if (mouseFollow)
+        {
+            mouseFollowThrowCount = 0;
+            if (roamAnimating)
+            {
+                roamAnimating = false;
+                ResetRoamPose();
+            }
+
+            CancelMouseFollowThrow();
+            SyncMouseFollowKinematics(resetVelocity: true);
+        }
+        else
+        {
+            mouseFollowThrowCount = 0;
+            CancelMouseFollowThrow();
+            StopMouseFollowPose();
+            SyncMouseFollowKinematics(resetVelocity: true);
+            if (desktopRoam)
+            {
+                ScheduleNextRoam(Environment.TickCount64, RoamRetryDelayMinMs, RoamRetryDelayMaxMs);
+            }
+        }
+
+        UpdateMouseFollowTimer();
+        UpdateDesktopRoamTimer();
+    }
+
     private void ToggleDesktopRoam()
     {
         MarkUserActivity();
@@ -482,6 +578,55 @@ internal sealed class PetForm : Form
     }
 
     internal bool GazeTrackingEnabled => gazeTracking;
+
+    internal void BeginPointerActivity()
+    {
+        inputPointerActive = true;
+        MarkUserActivity();
+        CancelMouseFollowThrow();
+        StopMouseFollowPose();
+        SyncMouseFollowKinematics(resetVelocity: true);
+    }
+
+    internal void EndPointerActivity()
+    {
+        inputPointerActive = false;
+        SyncMouseFollowKinematics(resetVelocity: true);
+    }
+
+    internal bool TryStartMouseFollowThrow(
+        Point dragVector,
+        Point flingVector,
+        double flingSpeed,
+        int lastMoveAgeMs,
+        int distance,
+        int durationMs)
+    {
+        if (!mouseFollow || distance < MouseFollowThrowMinDistance)
+        {
+            return false;
+        }
+
+        bool hasRecentFling = lastMoveAgeMs <= MouseFollowThrowRecentMoveMs
+            && GetVectorLength(flingVector.X, flingVector.Y) >= 1
+            && flingSpeed > 0;
+        Point direction = hasRecentFling ? flingVector : dragVector;
+        double directionLength = GetVectorLength(direction.X, direction.Y);
+        if (directionLength < 1)
+        {
+            return false;
+        }
+
+        double dragSpeed = durationMs > 0
+            ? distance * 1000.0 / durationMs
+            : MouseFollowThrowMinSpeed;
+        double speed = Math.Clamp(
+            Math.Max(MouseFollowThrowMinSpeed, Math.Max(dragSpeed, flingSpeed) * 1.15 + distance * 2.0),
+            MouseFollowThrowMinSpeed,
+            MouseFollowThrowMaxSpeed);
+        StartMouseFollowThrow(direction.X / directionLength, direction.Y / directionLength, speed, distance);
+        return true;
+    }
 
     internal void TriggerInteraction(string interaction, Point point, int distance = 0, int durationMs = 0)
     {
@@ -535,7 +680,7 @@ internal sealed class PetForm : Form
 
     private void SendGlobalGazePoint()
     {
-        if (!gazeTracking || clickThrough || roamAnimating)
+        if (!gazeTracking || clickThrough || roamAnimating || mouseFollow)
         {
             return;
         }
@@ -548,6 +693,7 @@ internal sealed class PetForm : Form
     {
         MarkUserActivity();
         Location = new Point(Location.X + dx, Location.Y + dy);
+        SyncMouseFollowKinematics(resetVelocity: true);
     }
 
     internal void BeginDragPose(Point clientPoint)
@@ -571,6 +717,7 @@ internal sealed class PetForm : Form
     {
         MarkUserActivity();
         Location = point;
+        SyncMouseFollowKinematics(resetVelocity: true);
     }
 
     internal void MarkUserActivity()
@@ -586,13 +733,115 @@ internal sealed class PetForm : Form
 
     private void UpdateDesktopRoamTimer()
     {
-        if (desktopRoam)
+        if (desktopRoam && !mouseFollow)
         {
             roamTimer.Start();
             return;
         }
 
         roamTimer.Stop();
+    }
+
+    private void UpdateMouseFollowTimer()
+    {
+        if (mouseFollow)
+        {
+            StartMouseFollowTimer();
+            return;
+        }
+
+        StopMouseFollowTimer();
+    }
+
+    private void StartMouseFollowTimer()
+    {
+        if (mouseFollowTimer is not null)
+        {
+            return;
+        }
+
+        BeginMouseFollowTimerPrecision();
+        mouseFollowLastFrameTick = System.Diagnostics.Stopwatch.GetTimestamp();
+        Interlocked.Exchange(ref mouseFollowFramePending, 0);
+        mouseFollowTimer = new System.Threading.Timer(
+            QueueMouseFollowFrame,
+            state: null,
+            dueTime: 0,
+            period: MouseFollowTimerIntervalMs);
+    }
+
+    private void StopMouseFollowTimer()
+    {
+        System.Threading.Timer? timer = mouseFollowTimer;
+        if (timer is null)
+        {
+            EndMouseFollowTimerPrecision();
+            return;
+        }
+
+        mouseFollowTimer = null;
+        timer.Change(Timeout.Infinite, Timeout.Infinite);
+        timer.Dispose();
+        Interlocked.Exchange(ref mouseFollowFramePending, 0);
+        mouseFollowLastFrameTick = 0;
+        EndMouseFollowTimerPrecision();
+    }
+
+    private void BeginMouseFollowTimerPrecision()
+    {
+        if (mouseFollowTimerPrecisionActive)
+        {
+            return;
+        }
+
+        if (TimeBeginPeriod(1) == 0)
+        {
+            mouseFollowTimerPrecisionActive = true;
+        }
+    }
+
+    private void EndMouseFollowTimerPrecision()
+    {
+        if (!mouseFollowTimerPrecisionActive)
+        {
+            return;
+        }
+
+        TimeEndPeriod(1);
+        mouseFollowTimerPrecisionActive = false;
+    }
+
+    private void QueueMouseFollowFrame(object? state)
+    {
+        if (IsDisposed || !IsHandleCreated || Interlocked.Exchange(ref mouseFollowFramePending, 1) == 1)
+        {
+            return;
+        }
+
+        try
+        {
+            BeginInvoke((MethodInvoker)RunMouseFollowFrame);
+        }
+        catch (InvalidOperationException)
+        {
+            Interlocked.Exchange(ref mouseFollowFramePending, 0);
+        }
+    }
+
+    private void RunMouseFollowFrame()
+    {
+        Interlocked.Exchange(ref mouseFollowFramePending, 0);
+        if (!mouseFollow)
+        {
+            return;
+        }
+
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        double elapsedSeconds = mouseFollowLastFrameTick > 0
+            ? (now - mouseFollowLastFrameTick) / (double)System.Diagnostics.Stopwatch.Frequency
+            : MouseFollowTimerIntervalMs / 1000.0;
+        mouseFollowLastFrameTick = now;
+        UpdateMouseFollow(Math.Clamp(elapsedSeconds, MouseFollowMinFrameSeconds, MouseFollowMaxFrameSeconds));
     }
 
     private void UpdateCodexStatusTimer()
@@ -750,10 +999,378 @@ internal sealed class PetForm : Form
         return string.Empty;
     }
 
+    private void UpdateMouseFollow(double elapsedSeconds)
+    {
+        if (!mouseFollow)
+        {
+            return;
+        }
+
+        if (mouseFollowThrowPhase != MouseFollowThrowPhase.None)
+        {
+            UpdateMouseFollowThrow(elapsedSeconds);
+            return;
+        }
+
+        if (!CanFollowMouse())
+        {
+            StopMouseFollowPose();
+            SyncMouseFollowKinematics(resetVelocity: true);
+            return;
+        }
+
+        SyncMouseFollowKinematics(resetVelocity: false);
+        Point targetLocation = GetMouseFollowTargetLocation();
+        double dx = targetLocation.X - mouseFollowX;
+        double dy = targetLocation.Y - mouseFollowY;
+        double distance = Math.Sqrt(dx * dx + dy * dy);
+
+        if (distance < MouseFollowPoseStartDistance
+            && GetVectorLength(mouseFollowVelocityX, mouseFollowVelocityY) < MouseFollowStopSpeed)
+        {
+            mouseFollowVelocityX = 0;
+            mouseFollowVelocityY = 0;
+            StopMouseFollowPose();
+            return;
+        }
+
+        mouseFollowVelocityX += dx * MouseFollowSpring * elapsedSeconds;
+        mouseFollowVelocityY += dy * MouseFollowSpring * elapsedSeconds;
+        double damping = Math.Exp(-MouseFollowDamping * elapsedSeconds);
+        mouseFollowVelocityX *= damping;
+        mouseFollowVelocityY *= damping;
+        LimitMouseFollowVelocity();
+
+        mouseFollowX += mouseFollowVelocityX * elapsedSeconds;
+        mouseFollowY += mouseFollowVelocityY * elapsedSeconds;
+        Point nextLocation = new((int)Math.Round(mouseFollowX), (int)Math.Round(mouseFollowY));
+        if (nextLocation != Location)
+        {
+            Location = nextLocation;
+        }
+
+        double speed = GetVectorLength(mouseFollowVelocityX, mouseFollowVelocityY);
+        double poseProgress = 0.12 + Math.Clamp(speed / MouseFollowMaxSpeed, 0, 1) * 0.44;
+        SendRoamPose(
+            active: true,
+            mouseFollowVelocityX,
+            mouseFollowVelocityY,
+            poseProgress,
+            source: "mouse-follow");
+        mouseFollowPoseActive = true;
+    }
+
+    private void StartMouseFollowThrow(double directionX, double directionY, double speed, int distance)
+    {
+        ResetDragPose();
+        StopMouseFollowPose();
+        SyncMouseFollowKinematics(resetVelocity: true);
+        mouseFollowThrowDirectionX = directionX;
+        mouseFollowThrowDirectionY = directionY;
+        mouseFollowThrowVelocityX = directionX * speed;
+        mouseFollowThrowVelocityY = directionY * speed;
+        mouseFollowThrowElapsedSeconds = 0;
+        mouseFollowThrowDurationSeconds = Math.Clamp(
+            MouseFollowThrowAwayMinDurationSeconds + distance / 900.0,
+            MouseFollowThrowAwayMinDurationSeconds,
+            MouseFollowThrowAwayMaxDurationSeconds);
+        mouseFollowThrowPhase = MouseFollowThrowPhase.ThrowingAway;
+    }
+
+    private void UpdateMouseFollowThrow(double elapsedSeconds)
+    {
+        if (!Visible || WindowState != FormWindowState.Normal || inputPointerActive || dragging)
+        {
+            CancelMouseFollowThrow();
+            SyncMouseFollowKinematics(resetVelocity: true);
+            return;
+        }
+
+        if (mouseFollowThrowPhase == MouseFollowThrowPhase.ThrowingAway)
+        {
+            ContinueMouseFollowThrowAway(elapsedSeconds);
+            return;
+        }
+
+        if (mouseFollowThrowPhase == MouseFollowThrowPhase.Reacting)
+        {
+            ContinueMouseFollowThrowReaction(elapsedSeconds);
+            return;
+        }
+
+        if (mouseFollowThrowPhase == MouseFollowThrowPhase.Returning)
+        {
+            ContinueMouseFollowThrowReturn(elapsedSeconds);
+        }
+    }
+
+    private void ContinueMouseFollowThrowAway(double elapsedSeconds)
+    {
+        mouseFollowThrowElapsedSeconds += elapsedSeconds;
+        double damping = Math.Exp(-MouseFollowThrowAwayDamping * elapsedSeconds);
+        mouseFollowThrowVelocityX *= damping;
+        mouseFollowThrowVelocityY *= damping;
+        mouseFollowX += mouseFollowThrowVelocityX * elapsedSeconds;
+        mouseFollowY += mouseFollowThrowVelocityY * elapsedSeconds;
+
+        Point candidate = new((int)Math.Round(mouseFollowX), (int)Math.Round(mouseFollowY));
+        Point nextLocation = ClampLocationToWorkingArea(candidate, Screen.FromPoint(GetPetCenter()).WorkingArea);
+        if (nextLocation.X != candidate.X)
+        {
+            mouseFollowThrowVelocityX = 0;
+            mouseFollowX = nextLocation.X;
+        }
+
+        if (nextLocation.Y != candidate.Y)
+        {
+            mouseFollowThrowVelocityY = 0;
+            mouseFollowY = nextLocation.Y;
+        }
+
+        if (nextLocation != Location)
+        {
+            Location = nextLocation;
+        }
+
+        double speed = GetVectorLength(mouseFollowThrowVelocityX, mouseFollowThrowVelocityY);
+        SendRoamPose(
+            active: true,
+            mouseFollowThrowVelocityX,
+            mouseFollowThrowVelocityY,
+            0.56 + Math.Clamp(speed / MouseFollowThrowMaxSpeed, 0, 1) * 0.28,
+            source: "mouse-follow-throw");
+        mouseFollowPoseActive = true;
+
+        if (mouseFollowThrowElapsedSeconds >= mouseFollowThrowDurationSeconds
+            || speed < MouseFollowThrowAwayMinFinishSpeed)
+        {
+            CompleteMouseFollowThrowAway();
+        }
+    }
+
+    private void CompleteMouseFollowThrowAway()
+    {
+        StopMouseFollowPose();
+        SyncMouseFollowKinematics(resetVelocity: true);
+        mouseFollowThrowCount++;
+        bool shouldStopFollowing = mouseFollowThrowCount >= MouseFollowThrowLimit;
+        if (shouldStopFollowing)
+        {
+            PlayMotion("Failed");
+            DisableMouseFollowAfterThrow();
+            return;
+        }
+
+        PlayMotion("Nope");
+        mouseFollowThrowElapsedSeconds = 0;
+        mouseFollowThrowDurationSeconds = MouseFollowThrowNopeHoldSeconds;
+        mouseFollowThrowVelocityX = 0;
+        mouseFollowThrowVelocityY = 0;
+        mouseFollowThrowPhase = MouseFollowThrowPhase.Reacting;
+    }
+
+    private void ContinueMouseFollowThrowReaction(double elapsedSeconds)
+    {
+        mouseFollowThrowElapsedSeconds += elapsedSeconds;
+        if (mouseFollowThrowElapsedSeconds < mouseFollowThrowDurationSeconds)
+        {
+            return;
+        }
+
+        StartMouseFollowThrowReturn();
+    }
+
+    private void StartMouseFollowThrowReturn()
+    {
+        Point targetLocation = GetMouseFollowThrowTargetLocation(mouseFollowThrowDirectionX, mouseFollowThrowDirectionY);
+        mouseFollowThrowStartX = mouseFollowX;
+        mouseFollowThrowStartY = mouseFollowY;
+        mouseFollowThrowTargetX = targetLocation.X;
+        mouseFollowThrowTargetY = targetLocation.Y;
+        mouseFollowThrowElapsedSeconds = 0;
+        double pathDistance = GetVectorLength(mouseFollowThrowTargetX - mouseFollowThrowStartX, mouseFollowThrowTargetY - mouseFollowThrowStartY);
+        mouseFollowThrowDurationSeconds = Math.Clamp(
+            MouseFollowThrowReturnMinDurationSeconds + pathDistance / MouseFollowThrowReturnDistanceDurationFactor,
+            MouseFollowThrowReturnMinDurationSeconds,
+            MouseFollowThrowReturnMaxDurationSeconds);
+        mouseFollowThrowPhase = MouseFollowThrowPhase.Returning;
+    }
+
+    private void ContinueMouseFollowThrowReturn(double elapsedSeconds)
+    {
+        double previousX = mouseFollowX;
+        double previousY = mouseFollowY;
+        mouseFollowThrowElapsedSeconds += elapsedSeconds;
+        double progress = Math.Clamp(mouseFollowThrowElapsedSeconds / Math.Max(0.001, mouseFollowThrowDurationSeconds), 0, 1);
+        double easedProgress = SmoothStep(progress);
+        mouseFollowX = mouseFollowThrowStartX + (mouseFollowThrowTargetX - mouseFollowThrowStartX) * easedProgress;
+        mouseFollowY = mouseFollowThrowStartY + (mouseFollowThrowTargetY - mouseFollowThrowStartY) * easedProgress;
+        mouseFollowThrowVelocityX = (mouseFollowX - previousX) / Math.Max(0.001, elapsedSeconds);
+        mouseFollowThrowVelocityY = (mouseFollowY - previousY) / Math.Max(0.001, elapsedSeconds);
+
+        Point nextLocation = new((int)Math.Round(mouseFollowX), (int)Math.Round(mouseFollowY));
+        if (nextLocation != Location)
+        {
+            Location = nextLocation;
+        }
+
+        double speed = GetVectorLength(mouseFollowThrowVelocityX, mouseFollowThrowVelocityY);
+        SendRoamPose(
+            active: true,
+            mouseFollowThrowVelocityX,
+            mouseFollowThrowVelocityY,
+            0.32 + Math.Sin(Math.PI * progress) * 0.34 + Math.Clamp(speed / MouseFollowThrowMaxSpeed, 0, 1) * 0.18,
+            source: "mouse-follow-throw");
+        mouseFollowPoseActive = true;
+
+        if (progress >= 1)
+        {
+            CompleteMouseFollowThrowReturn();
+        }
+    }
+
+    private void CompleteMouseFollowThrowReturn()
+    {
+        mouseFollowThrowPhase = MouseFollowThrowPhase.None;
+        mouseFollowThrowVelocityX = 0;
+        mouseFollowThrowVelocityY = 0;
+        mouseFollowThrowDirectionX = 0;
+        mouseFollowThrowDirectionY = 0;
+        mouseFollowThrowStartX = 0;
+        mouseFollowThrowStartY = 0;
+        mouseFollowThrowTargetX = 0;
+        mouseFollowThrowTargetY = 0;
+        StopMouseFollowPose();
+        SyncMouseFollowKinematics(resetVelocity: true);
+    }
+
+    private void DisableMouseFollowAfterThrow()
+    {
+        mouseFollow = false;
+        mouseFollowMenuItem.Checked = false;
+        mouseFollowThrowCount = 0;
+        CancelMouseFollowThrow();
+        StopMouseFollowPose();
+        SyncMouseFollowKinematics(resetVelocity: true);
+        UpdateMouseFollowTimer();
+        UpdateDesktopRoamTimer();
+    }
+
+    private void CancelMouseFollowThrow()
+    {
+        mouseFollowThrowPhase = MouseFollowThrowPhase.None;
+        mouseFollowThrowVelocityX = 0;
+        mouseFollowThrowVelocityY = 0;
+        mouseFollowThrowDirectionX = 0;
+        mouseFollowThrowDirectionY = 0;
+        mouseFollowThrowStartX = 0;
+        mouseFollowThrowStartY = 0;
+        mouseFollowThrowTargetX = 0;
+        mouseFollowThrowTargetY = 0;
+        mouseFollowThrowElapsedSeconds = 0;
+        mouseFollowThrowDurationSeconds = 0;
+    }
+
+    private bool CanFollowMouse()
+    {
+        return Visible
+            && WindowState == FormWindowState.Normal
+            && !dragging
+            && !inputPointerActive;
+    }
+
+    private Point GetMouseFollowTargetLocation()
+    {
+        Point cursor = Cursor.Position;
+        Point center = GetPetCenter();
+        double dx = cursor.X - center.X;
+        double dy = cursor.Y - center.Y;
+        double distance = Math.Sqrt(dx * dx + dy * dy);
+        if (distance <= MouseFollowComfortDistance)
+        {
+            return Location;
+        }
+
+        double targetCenterX = cursor.X - dx / distance * MouseFollowComfortDistance;
+        double targetCenterY = cursor.Y - dy / distance * MouseFollowComfortDistance;
+        Point targetLocation = new(
+            (int)Math.Round(targetCenterX - Width / 2.0),
+            (int)Math.Round(targetCenterY - Height / 2.0));
+        return ClampLocationToWorkingArea(targetLocation, Screen.FromPoint(cursor).WorkingArea);
+    }
+
+    private Point GetMouseFollowThrowTargetLocation(double directionX, double directionY)
+    {
+        Point cursor = Cursor.Position;
+        double length = GetVectorLength(directionX, directionY);
+        if (length < 0.001)
+        {
+            Point center = GetPetCenter();
+            directionX = cursor.X - center.X;
+            directionY = cursor.Y - center.Y;
+            length = GetVectorLength(directionX, directionY);
+        }
+
+        if (length < 0.001)
+        {
+            directionX = 0;
+            directionY = -1;
+            length = 1;
+        }
+
+        directionX /= length;
+        directionY /= length;
+        double targetCenterX = cursor.X - directionX * MouseFollowComfortDistance;
+        double targetCenterY = cursor.Y - directionY * MouseFollowComfortDistance;
+        Point targetLocation = new(
+            (int)Math.Round(targetCenterX - Width / 2.0),
+            (int)Math.Round(targetCenterY - Height / 2.0));
+        return ClampLocationToWorkingArea(targetLocation, Screen.FromPoint(cursor).WorkingArea);
+    }
+
+    private void LimitMouseFollowVelocity()
+    {
+        double speed = GetVectorLength(mouseFollowVelocityX, mouseFollowVelocityY);
+        if (speed <= MouseFollowMaxSpeed)
+        {
+            return;
+        }
+
+        double scale = MouseFollowMaxSpeed / speed;
+        mouseFollowVelocityX *= scale;
+        mouseFollowVelocityY *= scale;
+    }
+
+    private void SyncMouseFollowKinematics(bool resetVelocity)
+    {
+        if (Math.Abs(mouseFollowX - Location.X) > 2 || Math.Abs(mouseFollowY - Location.Y) > 2)
+        {
+            mouseFollowX = Location.X;
+            mouseFollowY = Location.Y;
+        }
+
+        if (resetVelocity)
+        {
+            mouseFollowVelocityX = 0;
+            mouseFollowVelocityY = 0;
+        }
+    }
+
+    private void StopMouseFollowPose()
+    {
+        if (!mouseFollowPoseActive)
+        {
+            return;
+        }
+
+        mouseFollowPoseActive = false;
+        ResetRoamPose(source: "mouse-follow");
+    }
+
     private void UpdateDesktopRoam()
     {
         long now = Environment.TickCount64;
-        if (!desktopRoam)
+        if (!desktopRoam || mouseFollow)
         {
             return;
         }
@@ -829,6 +1446,7 @@ internal sealed class PetForm : Form
         return Visible
             && WindowState == FormWindowState.Normal
             && !dragging
+            && !mouseFollow
             && !IsCodexChargingState()
             && now - lastUserActivityTick >= RoamQuietAfterUserMs
             && !IsCursorNearPet();
@@ -839,6 +1457,7 @@ internal sealed class PetForm : Form
         return Visible
             && WindowState == FormWindowState.Normal
             && !dragging
+            && !mouseFollow
             && !IsCodexChargingState()
             && now - lastUserActivityTick >= 400
             && !IsCursorNearPet();
@@ -882,21 +1501,22 @@ internal sealed class PetForm : Form
         nextRoamTick = now + Random.Shared.Next(minDelayMs, maxDelayMs + 1);
     }
 
-    private void SendRoamPose(bool active, double dx, double dy, double progress)
+    private void SendRoamPose(bool active, double dx, double dy, double progress, string source = "roam")
     {
         object payload = new
         {
             active,
             dx,
             dy,
-            progress
+            progress,
+            source
         };
         ExecutePlayerScript($"window.desktopPet?.setRoamPose({JsonSerializer.Serialize(payload)})");
     }
 
-    private void ResetRoamPose()
+    private void ResetRoamPose(string source = "roam")
     {
-        SendRoamPose(active: false, dx: 0, dy: 0, progress: 0);
+        SendRoamPose(active: false, dx: 0, dy: 0, progress: 0, source);
     }
 
     private void SendDragPose(bool active, Point clientPoint, int dx, int dy, int distance, int durationMs)
@@ -942,6 +1562,20 @@ internal sealed class PetForm : Form
         int dx = end.X - start.X;
         int dy = end.Y - start.Y;
         return (int)Math.Round(Math.Sqrt(dx * dx + dy * dy));
+    }
+
+    private Point ClampLocationToWorkingArea(Point point, Rectangle workingArea)
+    {
+        int maxX = Math.Max(workingArea.Left, workingArea.Right - Width);
+        int maxY = Math.Max(workingArea.Top, workingArea.Bottom - Height);
+        return new Point(
+            Math.Clamp(point.X, workingArea.Left, maxX),
+            Math.Clamp(point.Y, workingArea.Top, maxY));
+    }
+
+    private static double GetVectorLength(double x, double y)
+    {
+        return Math.Sqrt(x * x + y * y);
     }
 
     private static double SmoothStep(double value)
@@ -1033,6 +1667,12 @@ internal sealed class PetForm : Form
         int cy,
         uint flags);
 
+    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod", ExactSpelling = true)]
+    private static extern uint TimeBeginPeriod(uint period);
+
+    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod", ExactSpelling = true)]
+    private static extern uint TimeEndPeriod(uint period);
+
     private static Icon LoadAppIcon()
     {
         try
@@ -1080,6 +1720,9 @@ internal sealed class InputOverlayForm : Form
     private Point pendingClickClient;
     private Point dragStartScreen;
     private Point lastDragScreen;
+    private Point lastMoveDelta;
+    private DateTime lastDragMoveAt;
+    private double lastMoveSpeed;
 
     public InputOverlayForm(PetForm petForm, ContextMenuStrip contextMenu)
     {
@@ -1149,10 +1792,14 @@ internal sealed class InputOverlayForm : Form
         moved = false;
         longPressTriggered = false;
         dragPoseActive = false;
+        petForm.BeginPointerActivity();
         pressStartedAt = DateTime.UtcNow;
         pressClient = e.Location;
         dragStartScreen = PointToScreen(e.Location);
         lastDragScreen = dragStartScreen;
+        lastMoveDelta = Point.Empty;
+        lastDragMoveAt = pressStartedAt;
+        lastMoveSpeed = 0;
         longPressTimer.Stop();
         longPressTimer.Start();
     }
@@ -1177,7 +1824,12 @@ internal sealed class InputOverlayForm : Form
         int dx = screenPoint.X - lastDragScreen.X;
         int dy = screenPoint.Y - lastDragScreen.Y;
         int distance = GetDistance(dragStartScreen, screenPoint);
-        int durationMs = Math.Max(0, (int)(DateTime.UtcNow - pressStartedAt).TotalMilliseconds);
+        DateTime now = DateTime.UtcNow;
+        int durationMs = Math.Max(0, (int)(now - pressStartedAt).TotalMilliseconds);
+        double moveElapsedMs = Math.Max(1, (now - lastDragMoveAt).TotalMilliseconds);
+        lastMoveDelta = new Point(dx, dy);
+        lastMoveSpeed = GetDistance(Point.Empty, lastMoveDelta) * 1000.0 / moveElapsedMs;
+        lastDragMoveAt = now;
 
         if (!moved)
         {
@@ -1220,14 +1872,29 @@ internal sealed class InputOverlayForm : Form
 
         longPressTimer.Stop();
         dragging = false;
+        petForm.EndPointerActivity();
         Point releaseScreen = PointToScreen(e.Location);
         int distance = GetDistance(dragStartScreen, releaseScreen);
-        int durationMs = Math.Max(0, (int)(DateTime.UtcNow - pressStartedAt).TotalMilliseconds);
+        DateTime releasedAt = DateTime.UtcNow;
+        int durationMs = Math.Max(0, (int)(releasedAt - pressStartedAt).TotalMilliseconds);
+        int lastMoveAgeMs = Math.Max(0, (int)(releasedAt - lastDragMoveAt).TotalMilliseconds);
         if (moved)
         {
             if (dragPoseActive)
             {
                 dragPoseActive = false;
+            }
+
+            Point dragVector = new(releaseScreen.X - dragStartScreen.X, releaseScreen.Y - dragStartScreen.Y);
+            if (petForm.TryStartMouseFollowThrow(
+                dragVector,
+                lastMoveDelta,
+                lastMoveSpeed,
+                lastMoveAgeMs,
+                distance,
+                durationMs))
+            {
+                return;
             }
 
             petForm.TriggerInteraction("dragRelease", e.Location, distance, durationMs);
