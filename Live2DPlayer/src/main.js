@@ -112,7 +112,11 @@ const ROAM_RESET_PARAMETERS = [
   ['Param29', 0],
   ['Param24', 0],
   ['Param22', 0],
-  ['Param23', 0]
+  ['Param23', 0],
+  ['ParamEyeLOpen', 1],
+  ['ParamEyeROpen', 1],
+  ['ParamEyeBallX', 0],
+  ['ParamEyeBallY', 0]
 ];
 const DRAG_RESET_PARAMETERS = [
   ['Param7', 0],
@@ -163,8 +167,9 @@ const CODEX_STATUS_MOTIONS = {
   error: 'Failed',
   blocked: 'Nope'
 };
-const MOUSE_FOLLOW_POSE_SOURCES = new Set(['mouse-follow', 'mouse-follow-throw']);
+const MOUSE_AVOID_POSE_SOURCE = 'mouse-avoid';
 const THROW_POSE_SOURCE = 'mouse-follow-throw';
+const MOUSE_FOLLOW_POSE_SOURCES = new Set(['mouse-follow', THROW_POSE_SOURCE, MOUSE_AVOID_POSE_SOURCE]);
 
 const stageElement = document.querySelector('#stage');
 const statusElement = document.querySelector('#status');
@@ -566,31 +571,44 @@ function applyMovementAppendagePose({
   const load = clamp(activity, 0, 1.35);
   const lateral = clamp(directionX + dragPullX * 0.24, -1, 1);
   const vertical = clamp(directionY + dragPullY * 0.18, -1, 1);
+  const avoidFear = source === MOUSE_AVOID_POSE_SOURCE ? clamp(load * 0.62 + fast * 0.7, 0, 1.35) : 0;
   const throwBoost = source === THROW_POSE_SOURCE ? 1.22 : 1;
-  const flapRate = 2.35 + fast * 5.2 + (source === THROW_POSE_SOURCE ? 2.2 : 0);
+  const avoidBoost = source === MOUSE_AVOID_POSE_SOURCE ? 1.12 + avoidFear * 0.18 : 1;
+  const flapRate = 2.35
+    + fast * 5.2
+    + (source === THROW_POSE_SOURCE ? 2.2 : 0)
+    + (source === MOUSE_AVOID_POSE_SOURCE ? 1.8 + avoidFear * 2.3 : 0);
   const flap = Math.sin(now * flapRate + phase * Math.PI * 2);
   const counterFlap = Math.sin(now * (flapRate * 0.72) + phase * Math.PI * 2 + 1.7);
   const tremble = Math.sin(now * (8.5 + fast * 13.5) + phase * 5.1) * fast;
   const lift = -vertical;
-  const windLoad = load * throwBoost;
-  const earTuck = (-4.5 - fast * 8.5 + Math.max(0, vertical) * 3.5) * windLoad;
-  const earSpread = lateral * (7 + fast * 6) * windLoad;
+  const windLoad = load * throwBoost * avoidBoost;
+  const earTuck = (-4.5 - fast * 8.5 - avoidFear * 5.2 + Math.max(0, vertical) * 3.5) * windLoad;
+  const earSpread = lateral * (7 + fast * 6 + avoidFear * 4.2) * windLoad;
   const earFlutter = (flap * (2.3 + fast * 4.4) + tremble * 2.1) * windLoad;
-  const earVertical = (lift * (8.5 + fast * 5.5) + counterFlap * (2 + fast * 3.2)) * windLoad;
+  const earVertical = (lift * (8.5 + fast * 5.5) + counterFlap * (2 + fast * 3.2 + avoidFear * 2.4)) * windLoad;
 
   setParameter('Param19', clamp(earTuck - earSpread + earFlutter, -30, 18));
   setParameter('Param28', clamp(earTuck + earSpread - earFlutter * 0.92, -30, 18));
   setParameter('Param29', clamp(earVertical, -24, 24));
 
-  const wingBase = (5.5 + fast * 6.5 - vertical * 4.2) * windLoad;
-  const wingFlap = (flap * (5.5 + fast * 9.5) + tremble * 3.6) * windLoad;
-  const wingBank = lateral * (8 + fast * 9) * windLoad;
-  const wingLift = (lift * (9.5 + fast * 8.5) + counterFlap * (4 + fast * 5.5)) * windLoad;
-  const trailingKick = Math.max(0, fast - 0.34) * 11 * windLoad;
+  const wingBase = (5.5 + fast * 6.5 + avoidFear * 3.6 - vertical * 4.2) * windLoad;
+  const wingFlap = (flap * (5.5 + fast * 9.5 + avoidFear * 5.8) + tremble * (3.6 + avoidFear * 2.2)) * windLoad;
+  const wingBank = lateral * (8 + fast * 9 + avoidFear * 6.4) * windLoad;
+  const wingLift = (lift * (9.5 + fast * 8.5) + counterFlap * (4 + fast * 5.5 + avoidFear * 3.8)) * windLoad;
+  const trailingKick = Math.max(0, fast - 0.34) * (11 + avoidFear * 8) * windLoad;
 
   setParameter('Param24', clamp(wingBase + wingLift + wingFlap * 0.36, -30, 30));
   setParameter('Param22', clamp(-10 - wingBank - wingFlap - trailingKick, -30, 18));
   setParameter('Param23', clamp(-10 + wingBank + wingFlap * 0.88 - trailingKick * 0.72, -30, 18));
+
+  if (source === MOUSE_AVOID_POSE_SOURCE) {
+    const glance = 0.24 + fast * 0.26 + avoidFear * 0.12;
+    setParameter('ParamEyeBallX', clamp(-directionX * glance, -0.55, 0.55));
+    setParameter('ParamEyeBallY', clamp(-directionY * (0.18 + avoidFear * 0.08), -0.35, 0.35));
+    setParameter('ParamEyeLOpen', clamp(0.92 + avoidFear * 0.08 + Math.abs(tremble) * 0.03, 0.88, 1));
+    setParameter('ParamEyeROpen', clamp(0.92 + avoidFear * 0.08 + Math.abs(tremble) * 0.03, 0.88, 1));
+  }
 }
 
 function updateRoamPose() {
@@ -602,15 +620,20 @@ function updateRoamPose() {
   const now = performance.now() / 1000;
   const sourceSpeed = source === 'roam'
     ? clamp(speed / 110, 0, 1)
-    : clamp(speed / (source === THROW_POSE_SOURCE ? 1700 : 1050), 0, 1);
+    : clamp(speed / (source === THROW_POSE_SOURCE ? 1700 : source === MOUSE_AVOID_POSE_SOURCE ? 1320 : 1050), 0, 1);
   const phaseActivity = source === 'roam'
     ? Math.sin(Math.PI * progress) * 0.45
-    : progress * 0.72;
-  const activity = clamp(0.22 + phaseActivity + sourceSpeed * 0.62, 0.18, 1.28);
+    : source === MOUSE_AVOID_POSE_SOURCE
+      ? 0.2 + progress * 0.78
+      : progress * 0.72;
+  const activity = clamp(0.22 + phaseActivity + sourceSpeed * 0.62, 0.18, 1.32);
+  const focusSign = source === MOUSE_AVOID_POSE_SOURCE ? -1 : 1;
+  const focusX = dx * focusSign * (0.22 + sourceSpeed * 0.14);
+  const focusY = dy * focusSign * (0.18 + sourceSpeed * 0.12);
 
   model.focus(
-    app.screen.width * (0.5 + dx * (0.22 + sourceSpeed * 0.14)),
-    app.screen.height * (0.5 + dy * (0.18 + sourceSpeed * 0.12))
+    app.screen.width * (0.5 + focusX),
+    app.screen.height * (0.5 + focusY)
   );
 
   applyMovementAppendagePose({
