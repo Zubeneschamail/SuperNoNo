@@ -1,0 +1,76 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "/VIP nono/VIP nono/VIP nono .moc3",
+    "Textures": [
+      "/VIP nono/VIP nono/VIP nono .4096/texture_00.png"
+    ],
+    "Physics": "/VIP nono/VIP nono/VIP nono .physics3.json",
+    "DisplayInfo": "/VIP nono/VIP nono/VIP nono .cdi3.json",
+    "Motions": {
+      "Charge": [
+        {
+          "File": "/VIP nono/VIP nono/motion/充电.motion3.json",
+          "Sound": "/VIP nono/VIP nono/music/chongdian.mp3"
+        }
+      ],
+      "Nope": [
+        {
+          "File": "/VIP nono/VIP nono/motion/大咩.motion3.json"
+        }
+      ],
+      "Yawn": [
+        {
+          "File": "/VIP nono/VIP nono/motion/哈气.motion3.json"
+        }
+      ],
+      "Failed": [
+        {
+          "File": "/VIP nono/VIP nono/motion/沮丧.motion3.json"
+        }
+      ],
+      "Happy": [
+        {
+          "File": "/VIP nono/VIP nono/motion/开心.motion3.json"
+        }
+      ],
+      "Sweat": [
+        {
+          "File": "/VIP nono/VIP nono/motion/流汗.motion3.json"
+        }
+      ],
+      "Sleepy": [
+        {
+          "File": "/VIP nono/VIP nono/motion/迷糊.motion3.json"
+        }
+      ],
+      "Dance": [
+        {
+          "File": "/VIP nono/VIP nono/motion/跳舞.motion3.json"
+        }
+      ],
+      "JoyJump": [
+        {
+          "File": "/VIP nono/VIP nono/motion/喜悦跳.motion3.json"
+        }
+      ]
+    }
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Ids": [
+        "ParamEyeLOpen",
+        "ParamEyeROpen"
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Ids": [
+        "ParamMouthOpenY"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Moc": "VIP nono .moc3",
+		"Textures": [
+			"VIP nono .4096/texture_00.png"
+		],
+		"Physics": "VIP nono .physics3.json",
+		"DisplayInfo": "VIP nono .cdi3.json"
+	},
+	"Groups": [
+		{
+			"Target": "Parameter",
+			"Name": "EyeBlink",
+			"Ids": []
+		},
+		{
+			"Target": "Parameter",
+			"Name": "LipSync",
+			"Ids": []
+		}
+	]
+}

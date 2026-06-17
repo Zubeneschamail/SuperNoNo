@@ -1,0 +1,8 @@
+bin/
+obj/
+Live2DPlayer/dist/
+Live2DPlayer/node_modules/
+*.user
+*.suo
+.vs/
+.tmp/

@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>SuperNoNo</AssemblyName>
+    <RootNamespace>SuperNoNo</RootNamespace>
+    <ApplicationIcon>Assets\SuperNoNo.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4022.49" />
+  </ItemGroup>
+  <Target Name="BuildLive2DPlayer" BeforeTargets="Build">
+    <Exec WorkingDirectory="Live2DPlayer" Command="npm install" Condition="!Exists('Live2DPlayer\node_modules')" />
+    <Exec WorkingDirectory="Live2DPlayer" Command="npm run build" />
+  </Target>
+  <Target Name="CopyLive2DRuntimeAssets" AfterTargets="Build">
+    <ItemGroup>
+      <Live2DPlayerFiles Include="Live2DPlayer\dist\**\*.*" />
+      <Live2DModelFiles Include="VIP nono\**\*.*" />
+    </ItemGroup>
+    <Copy
+      SourceFiles="@(Live2DPlayerFiles)"
+      DestinationFiles="@(Live2DPlayerFiles->'$(OutDir)Live2DPlayer\dist\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+    <Copy
+      SourceFiles="@(Live2DModelFiles)"
+      DestinationFiles="@(Live2DModelFiles->'$(OutDir)VIP nono\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+  </Target>
+</Project>
