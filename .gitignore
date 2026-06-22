@@ -6,3 +6,5 @@ Live2DPlayer/node_modules/
 *.suo
 .vs/
 .tmp/
+artifacts/
+Installer/payload.zip

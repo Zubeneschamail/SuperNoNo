@@ -60,6 +60,8 @@ internal sealed class PetForm : Form
     private const int RoamDurationMaxMs = 5200;
     private const int MouseFollowTimerIntervalMs = 8;
     private const int MouseFollowComfortDistance = 118;
+    private const int MouseFollowComfortSettlePadding = 10;
+    private const int MouseFollowComfortResumePadding = 24;
     private const int MouseFollowPoseStartDistance = 2;
     private const double MouseFollowSpring = 92.0;
     private const double MouseFollowDamping = 18.0;
@@ -160,10 +162,12 @@ internal sealed class PetForm : Form
     private bool inputPointerActive;
     private bool roamAnimating;
     private bool mouseFollowPoseActive;
+    private bool mouseFollowComfortSettled;
     private bool mouseFollowTimerPrecisionActive;
     private MouseFollowThrowPhase mouseFollowThrowPhase;
     private Point lastDragScreen;
     private Point webDragStartScreen;
+    private Point webDragStartLocation;
     private DateTime webDragStartedAt;
     private Point roamStartLocation;
     private Point roamTargetLocation;
@@ -458,6 +462,7 @@ internal sealed class PetForm : Form
             dragging = true;
             lastDragScreen = screenPoint;
             webDragStartScreen = screenPoint;
+            webDragStartLocation = Location;
             webDragStartedAt = DateTime.UtcNow;
             SendDragPose(active: true, PointToClient(screenPoint), 0, 0, 0, 0);
             return;
@@ -470,7 +475,15 @@ internal sealed class PetForm : Form
 
         int dx = screenPoint.X - lastDragScreen.X;
         int dy = screenPoint.Y - lastDragScreen.Y;
-        Location = new Point(Location.X + dx, Location.Y + dy);
+        Point targetLocation = new(
+            webDragStartLocation.X + screenPoint.X - webDragStartScreen.X,
+            webDragStartLocation.Y + screenPoint.Y - webDragStartScreen.Y);
+        if (dx == 0 && dy == 0 && targetLocation == Location)
+        {
+            return;
+        }
+
+        MoveDragTo(targetLocation);
         lastDragScreen = screenPoint;
         SendDragPose(
             active: true,
@@ -748,7 +761,7 @@ internal sealed class PetForm : Form
 
     private void SendGlobalGazePoint()
     {
-        if (!gazeTracking || clickThrough || roamAnimating || IsMouseReactiveModeEnabled())
+        if (!gazeTracking || clickThrough || roamAnimating || inputPointerActive || dragging || IsMouseReactiveModeEnabled())
         {
             return;
         }
@@ -761,6 +774,18 @@ internal sealed class PetForm : Form
     {
         MarkUserActivity();
         Location = new Point(Location.X + dx, Location.Y + dy);
+        SyncMouseFollowKinematics(resetVelocity: true);
+    }
+
+    internal void MoveDragTo(Point location)
+    {
+        MarkUserActivity();
+        if (Location == location)
+        {
+            return;
+        }
+
+        Location = location;
         SyncMouseFollowKinematics(resetVelocity: true);
     }
 
@@ -1100,6 +1125,31 @@ internal sealed class PetForm : Form
         }
 
         SyncMouseFollowKinematics(resetVelocity: false);
+        Point cursor = Cursor.Position;
+        Point center = GetPetCenter();
+        double cursorDistance = GetVectorLength(cursor.X - center.X, cursor.Y - center.Y);
+        if (mouseFollowComfortSettled)
+        {
+            if (cursorDistance <= MouseFollowComfortDistance + MouseFollowComfortResumePadding)
+            {
+                mouseFollowVelocityX = 0;
+                mouseFollowVelocityY = 0;
+                StopMouseFollowPose();
+                return;
+            }
+
+            mouseFollowComfortSettled = false;
+        }
+
+        if (cursorDistance <= MouseFollowComfortDistance + MouseFollowComfortSettlePadding)
+        {
+            mouseFollowVelocityX = 0;
+            mouseFollowVelocityY = 0;
+            mouseFollowComfortSettled = true;
+            StopMouseFollowPose();
+            return;
+        }
+
         Point targetLocation = GetMouseFollowTargetLocation();
         double dx = targetLocation.X - mouseFollowX;
         double dy = targetLocation.Y - mouseFollowY;
@@ -1626,6 +1676,7 @@ internal sealed class PetForm : Form
         {
             mouseFollowVelocityX = 0;
             mouseFollowVelocityY = 0;
+            mouseFollowComfortSettled = false;
         }
     }
 
@@ -1992,6 +2043,7 @@ internal sealed class InputOverlayForm : Form
     private Point pressClient;
     private Point pendingClickClient;
     private Point dragStartScreen;
+    private Point dragStartPetLocation;
     private Point lastDragScreen;
     private Point lastMoveDelta;
     private DateTime lastDragMoveAt;
@@ -2068,7 +2120,8 @@ internal sealed class InputOverlayForm : Form
         petForm.BeginPointerActivity();
         pressStartedAt = DateTime.UtcNow;
         pressClient = e.Location;
-        dragStartScreen = PointToScreen(e.Location);
+        dragStartScreen = Cursor.Position;
+        dragStartPetLocation = petForm.Location;
         lastDragScreen = dragStartScreen;
         lastMoveDelta = Point.Empty;
         lastDragMoveAt = pressStartedAt;
@@ -2086,7 +2139,7 @@ internal sealed class InputOverlayForm : Form
             return;
         }
 
-        Point screenPoint = PointToScreen(e.Location);
+        Point screenPoint = Cursor.Position;
         if (!moved
             && Math.Abs(screenPoint.X - dragStartScreen.X) < DragThreshold
             && Math.Abs(screenPoint.Y - dragStartScreen.Y) < DragThreshold)
@@ -2096,6 +2149,14 @@ internal sealed class InputOverlayForm : Form
 
         int dx = screenPoint.X - lastDragScreen.X;
         int dy = screenPoint.Y - lastDragScreen.Y;
+        Point targetLocation = new(
+            dragStartPetLocation.X + screenPoint.X - dragStartScreen.X,
+            dragStartPetLocation.Y + screenPoint.Y - dragStartScreen.Y);
+        if (dx == 0 && dy == 0 && targetLocation == petForm.Location)
+        {
+            return;
+        }
+
         int distance = GetDistance(dragStartScreen, screenPoint);
         DateTime now = DateTime.UtcNow;
         int durationMs = Math.Max(0, (int)(now - pressStartedAt).TotalMilliseconds);
@@ -2108,13 +2169,13 @@ internal sealed class InputOverlayForm : Form
         {
             moved = true;
             dragPoseActive = true;
-            petForm.BeginDragPose(e.Location);
+            petForm.BeginDragPose(pressClient);
         }
 
         longPressTimer.Stop();
         CancelPendingClick();
-        petForm.MoveBy(dx, dy);
-        petForm.UpdateDragPose(e.Location, dx, dy, distance, durationMs);
+        petForm.MoveDragTo(targetLocation);
+        petForm.UpdateDragPose(pressClient, dx, dy, distance, durationMs);
         lastDragScreen = screenPoint;
     }
 
@@ -2146,7 +2207,7 @@ internal sealed class InputOverlayForm : Form
         longPressTimer.Stop();
         dragging = false;
         petForm.EndPointerActivity();
-        Point releaseScreen = PointToScreen(e.Location);
+        Point releaseScreen = Cursor.Position;
         int distance = GetDistance(dragStartScreen, releaseScreen);
         DateTime releasedAt = DateTime.UtcNow;
         int durationMs = Math.Max(0, (int)(releasedAt - pressStartedAt).TotalMilliseconds);
@@ -2156,6 +2217,7 @@ internal sealed class InputOverlayForm : Form
             if (dragPoseActive)
             {
                 dragPoseActive = false;
+                petForm.ResetDragPose();
             }
 
             Point dragVector = new(releaseScreen.X - dragStartScreen.X, releaseScreen.Y - dragStartScreen.Y);

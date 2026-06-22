@@ -1,4 +1,4 @@
-import { Application, extensions } from 'pixi.js';
+import { Application, UPDATE_PRIORITY, extensions } from 'pixi.js';
 import { configureCubismSDK, Live2DModel, Live2DPlugin, MotionPriority } from 'untitled-pixi-live2d-engine/cubism';
 
 import './style.css';
@@ -27,6 +27,12 @@ const MODEL_TARGET_WIDTH = 176;
 const MODEL_TARGET_HEIGHT = 218;
 const MODEL_POSITION_OFFSET_X = 0;
 const MODEL_POSITION_OFFSET_Y = -6;
+const DRAG_DIRECTION_DEADZONE = 0.45;
+const DRAG_DIRECTION_BLEND_MIN = 0.1;
+const DRAG_DIRECTION_BLEND_MAX = 0.26;
+const DRAG_PULL_BLEND = 0.18;
+const DRAG_SPEED_RISE_BLEND = 0.24;
+const DRAG_SPEED_FALL_BLEND = 0.14;
 const MOTION_RESET_PARAMETERS = [
   ['Param', 0],
   ['Param2', 0],
@@ -41,6 +47,9 @@ const MOTION_RESET_PARAMETERS = [
   ['Param11', 0],
   ['Param12', 0],
   ['Param13', 0],
+  ['Param14', 0],
+  ['Param15', 0],
+  ['Param16', 0],
   ['Param17', 0],
   ['Param18', 0],
   ['Param19', 0],
@@ -58,12 +67,18 @@ const MOTION_RESET_PARAMETERS = [
   ['ParamEyeROpen', 1],
   ['ParamEyeBallX', 0],
   ['ParamEyeBallY', 0],
+  ['ParamAngleX', 0],
+  ['ParamAngleY', 0],
+  ['ParamAngleZ', 0],
   ['ParamEyeLSmile', 0],
   ['ParamEyeRSmile', 0]
 ];
 const IDLE_PARAMETERS = [
   ['Param4', 0],
   ['Param27', 1],
+  ['Param14', 0],
+  ['Param15', 0],
+  ['Param16', 0],
   ['Param19', 0],
   ['Param28', 0],
   ['Param29', 0],
@@ -74,6 +89,9 @@ const IDLE_PARAMETERS = [
   ['ParamEyeROpen', 1],
   ['ParamEyeBallX', 0],
   ['ParamEyeBallY', 0],
+  ['ParamAngleX', 0],
+  ['ParamAngleY', 0],
+  ['ParamAngleZ', 0],
   ['ParamEyeLSmile', 0],
   ['ParamEyeRSmile', 0]
 ];
@@ -107,6 +125,9 @@ const DRAG_RELEASE_MOTIONS = {
   long: ['Sweat', 'Nope', 'Failed']
 };
 const ROAM_RESET_PARAMETERS = [
+  ['Param14', 0],
+  ['Param15', 0],
+  ['Param16', 0],
   ['Param19', 0],
   ['Param28', 0],
   ['Param29', 0],
@@ -116,7 +137,10 @@ const ROAM_RESET_PARAMETERS = [
   ['ParamEyeLOpen', 1],
   ['ParamEyeROpen', 1],
   ['ParamEyeBallX', 0],
-  ['ParamEyeBallY', 0]
+  ['ParamEyeBallY', 0],
+  ['ParamAngleX', 0],
+  ['ParamAngleY', 0],
+  ['ParamAngleZ', 0]
 ];
 const DRAG_RESET_PARAMETERS = [
   ['Param7', 0],
@@ -124,12 +148,18 @@ const DRAG_RESET_PARAMETERS = [
   ['Param9', 0],
   ['Param10', 0],
   ['Param11', 0],
+  ['Param14', 0],
+  ['Param15', 0],
+  ['Param16', 0],
   ['Param19', 0],
   ['Param28', 0],
   ['Param29', 0],
   ['Param24', 0],
   ['Param22', 0],
-  ['Param23', 0]
+  ['Param23', 0],
+  ['ParamAngleX', 0],
+  ['ParamAngleY', 0],
+  ['ParamAngleZ', 0]
 ];
 const CODEX_STATUS_MOTION_COOLDOWN_MS = 9000;
 const CODEX_CHARGING_STATES = new Set([
@@ -189,7 +219,15 @@ let roamPoseActive = false;
 let roamPoseSource = 'roam';
 let roamPoseDirection = { dx: 0, dy: 0, progress: 0, speed: 0, source: 'roam' };
 let dragPoseActive = false;
-let dragPose = { clientX: 0, clientY: 0, dx: 0, dy: 0, distance: 0, durationMs: 0 };
+let dragPose = { clientX: 0, clientY: 0, dx: 0, dy: 0, distance: 0, durationMs: 0, updatedAt: 0 };
+let dragPoseSmoothing = {
+  directionX: 0,
+  directionY: 0,
+  pullX: 0,
+  pullY: 0,
+  speed: 0,
+  initialized: false
+};
 let codexStatusActive = false;
 let codexStatusState = 'idle';
 let codexStatusMessage = '';
@@ -250,6 +288,28 @@ function randomDifferentMotion(items) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function normalizeVector(x, y, fallbackX = 0, fallbackY = 0) {
+  const length = Math.hypot(x, y);
+  if (length <= 0.001) {
+    return { x: fallbackX, y: fallbackY };
+  }
+
+  return { x: x / length, y: y / length };
+}
+
+function resetDragPoseSmoothing(clientX = 0, clientY = 0) {
+  const screenWidth = Math.max(1, app?.screen?.width ?? 1);
+  const screenHeight = Math.max(1, app?.screen?.height ?? 1);
+  dragPoseSmoothing = {
+    directionX: 0,
+    directionY: 0,
+    pullX: clamp((clientX / screenWidth - 0.5) * 2, -1, 1),
+    pullY: clamp((clientY / screenHeight - 0.5) * 2, -1, 1),
+    speed: 0,
+    initialized: true
+  };
 }
 
 function markInteraction() {
@@ -567,10 +627,28 @@ function applyMovementAppendagePose({
   dragPullY = 0,
   source = 'roam'
 }) {
-  const fast = clamp(speedPressure, 0, 1);
-  const load = clamp(activity, 0, 1.35);
+  const sourceSpeedBoost = source === THROW_POSE_SOURCE
+    ? 1.34
+    : source === 'drag'
+      ? 0.82
+      : source === 'mouse-follow'
+        ? 1.2
+        : 1;
+  const sourceLoadBoost = source === THROW_POSE_SOURCE
+    ? 1.32
+    : source === 'drag'
+      ? 0.84
+      : source === 'mouse-follow'
+        ? 1.16
+        : 1;
+  const poseScale = source === 'drag' ? 0.38 : 1;
+  const bodyScale = source === 'drag' ? 0.24 : 1;
+  const fast = clamp(speedPressure * sourceSpeedBoost, 0, 1);
+  const load = clamp(activity * sourceLoadBoost, 0, source === 'drag' ? 1.05 : 1.7);
   const lateral = clamp(directionX + dragPullX * 0.24, -1, 1);
   const vertical = clamp(directionY + dragPullY * 0.18, -1, 1);
+  const trailX = clamp(-directionX + dragPullX * 0.14, -1, 1);
+  const trailY = clamp(-directionY + dragPullY * 0.1, -1, 1);
   const avoidFear = source === MOUSE_AVOID_POSE_SOURCE ? clamp(load * 0.62 + fast * 0.7, 0, 1.35) : 0;
   const throwBoost = source === THROW_POSE_SOURCE ? 1.22 : 1;
   const avoidBoost = source === MOUSE_AVOID_POSE_SOURCE ? 1.12 + avoidFear * 0.18 : 1;
@@ -581,26 +659,48 @@ function applyMovementAppendagePose({
   const flap = Math.sin(now * flapRate + phase * Math.PI * 2);
   const counterFlap = Math.sin(now * (flapRate * 0.72) + phase * Math.PI * 2 + 1.7);
   const tremble = Math.sin(now * (8.5 + fast * 13.5) + phase * 5.1) * fast;
-  const lift = -vertical;
-  const windLoad = load * throwBoost * avoidBoost;
-  const earTuck = (-4.5 - fast * 8.5 - avoidFear * 5.2 + Math.max(0, vertical) * 3.5) * windLoad;
-  const earSpread = lateral * (7 + fast * 6 + avoidFear * 4.2) * windLoad;
-  const earFlutter = (flap * (2.3 + fast * 4.4) + tremble * 2.1) * windLoad;
-  const earVertical = (lift * (8.5 + fast * 5.5) + counterFlap * (2 + fast * 3.2 + avoidFear * 2.4)) * windLoad;
+  const flutterScale = source === 'drag' ? 0.32 + fast * 0.68 : 1;
+  const hoverScale = source === 'drag' ? 0.48 + fast * 0.52 : 1;
+  const hoverRate = 1.45
+    + fast * 1.7
+    + (source === THROW_POSE_SOURCE ? 0.9 : 0)
+    + (source === MOUSE_AVOID_POSE_SOURCE ? 0.7 : 0);
+  const hover = Math.sin(now * hoverRate + phase * Math.PI * 2 + 0.55);
+  const hoverCounter = Math.sin(now * (hoverRate * 1.34) + phase * Math.PI * 2 + 2.1);
+  const windLoad = load * throwBoost * avoidBoost * poseScale;
+  const trailingLoad = clamp(0.42 + fast * 0.9 + avoidFear * 0.34, 0.42, 1.55) * windLoad;
+  const earTuck = (-5.5 - fast * 9.5 - avoidFear * 5.2 + Math.max(0, vertical) * 3.5) * windLoad;
+  const earSpread = trailX * (8.5 + fast * 9 + avoidFear * 4.8) * trailingLoad;
+  const earFlutter = (flap * (2.3 + fast * 4.4) + tremble * 2.1) * windLoad * flutterScale;
+  const earVertical = (
+    trailY * (9.5 + fast * 7.2)
+    + counterFlap * (2 + fast * 3.2 + avoidFear * 2.4) * flutterScale
+    - hover * (1.6 + fast * 2.2) * hoverScale
+  ) * windLoad;
 
   setParameter('Param19', clamp(earTuck - earSpread + earFlutter, -30, 18));
   setParameter('Param28', clamp(earTuck + earSpread - earFlutter * 0.92, -30, 18));
   setParameter('Param29', clamp(earVertical, -24, 24));
 
   const wingBase = (5.5 + fast * 6.5 + avoidFear * 3.6 - vertical * 4.2) * windLoad;
-  const wingFlap = (flap * (5.5 + fast * 9.5 + avoidFear * 5.8) + tremble * (3.6 + avoidFear * 2.2)) * windLoad;
-  const wingBank = lateral * (8 + fast * 9 + avoidFear * 6.4) * windLoad;
-  const wingLift = (lift * (9.5 + fast * 8.5) + counterFlap * (4 + fast * 5.5 + avoidFear * 3.8)) * windLoad;
-  const trailingKick = Math.max(0, fast - 0.34) * (11 + avoidFear * 8) * windLoad;
+  const wingFlap = (flap * (5.5 + fast * 9.5 + avoidFear * 5.8) + tremble * (3.6 + avoidFear * 2.2)) * windLoad * flutterScale;
+  const wingBank = trailX * (10 + fast * 11 + avoidFear * 6.4) * trailingLoad;
+  const wingLift = (
+    trailY * (11 + fast * 10)
+    + counterFlap * (4 + fast * 5.5 + avoidFear * 3.8) * flutterScale
+    - hoverCounter * (2.2 + fast * 3.4) * hoverScale
+  ) * windLoad;
+  const trailingKick = Math.max(0, fast - 0.28) * (13 + avoidFear * 8) * trailingLoad;
 
   setParameter('Param24', clamp(wingBase + wingLift + wingFlap * 0.36, -30, 30));
   setParameter('Param22', clamp(-10 - wingBank - wingFlap - trailingKick, -30, 18));
   setParameter('Param23', clamp(-10 + wingBank + wingFlap * 0.88 - trailingKick * 0.72, -30, 18));
+  setParameter('Param14', clamp(directionX * (4.2 + fast * 7.4) * load * bodyScale, -10, 10));
+  setParameter('Param15', clamp((hover * (6.2 + fast * 8.8) * load - directionY * (3.4 + fast * 5.6)) * bodyScale, -10, 16));
+  setParameter('Param16', clamp((-lateral * (4.2 + fast * 7.8) * load + hoverCounter * (1.2 + fast * 2.4)) * bodyScale, -8, 8));
+  setParameter('ParamAngleX', clamp(directionX * (8.5 + fast * 8.5) * load * bodyScale, -14, 14));
+  setParameter('ParamAngleY', clamp((-directionY * (7.2 + fast * 7.4) * load + hover * (1.4 + fast * 2.2)) * bodyScale, -12, 12));
+  setParameter('ParamAngleZ', clamp((-lateral * (7.5 + fast * 9.5) * load + hoverCounter * (1.6 + fast * 2.6)) * bodyScale, -12, 12));
 
   if (source === MOUSE_AVOID_POSE_SOURCE) {
     const glance = 0.24 + fast * 0.26 + avoidFear * 0.12;
@@ -611,12 +711,54 @@ function applyMovementAppendagePose({
   }
 }
 
+function applyStableDragAppendagePose({
+  directionX,
+  directionY,
+  speedPressure,
+  activity,
+  dragPullX,
+  dragPullY
+}) {
+  const fast = clamp(speedPressure, 0, 1);
+  const load = clamp(activity, 0, 1);
+  const directionLoad = clamp(Math.hypot(directionX, directionY), 0, 1);
+  const trailX = clamp(-directionX + dragPullX * 0.08, -1, 1);
+  const trailY = clamp(-directionY + dragPullY * 0.06, -1, 1);
+  const lateral = clamp(directionX + dragPullX * 0.12, -1, 1);
+  const softLoad = load * (0.26 + directionLoad * 0.74);
+  const earBack = (-2.8 - fast * 4.8) * softLoad;
+  const earSpread = trailX * (3.8 + fast * 5.2) * softLoad;
+  const earVertical = trailY * (4.8 + fast * 5.8) * softLoad;
+  const wingBase = (2.2 + fast * 3.8 - directionY * 1.8) * softLoad;
+  const wingBank = trailX * (4.4 + fast * 6.2) * softLoad;
+  const wingLift = trailY * (5.2 + fast * 6.8) * softLoad;
+  const trailingKick = Math.max(0, fast - 0.22) * 5.2 * softLoad;
+  const bodyLoad = softLoad * 0.22;
+
+  setParameter('Param19', clamp(earBack - earSpread, -14, 10));
+  setParameter('Param28', clamp(earBack + earSpread, -14, 10));
+  setParameter('Param29', clamp(earVertical, -10, 10));
+  setParameter('Param24', clamp(wingBase + wingLift, -14, 14));
+  setParameter('Param22', clamp(-6 - wingBank - trailingKick, -18, 10));
+  setParameter('Param23', clamp(-6 + wingBank - trailingKick * 0.72, -18, 10));
+  setParameter('Param14', clamp(directionX * (3.8 + fast * 5.2) * bodyLoad, -5, 5));
+  setParameter('Param15', clamp(-directionY * (3.2 + fast * 4.8) * bodyLoad, -5, 8));
+  setParameter('Param16', clamp(-lateral * (3.6 + fast * 5.4) * bodyLoad, -5, 5));
+  setParameter('ParamAngleX', clamp(directionX * (6.2 + fast * 5.8) * bodyLoad, -7, 7));
+  setParameter('ParamAngleY', clamp(-directionY * (5.4 + fast * 5.2) * bodyLoad, -6, 6));
+  setParameter('ParamAngleZ', clamp(-lateral * (5.8 + fast * 6.2) * bodyLoad, -7, 7));
+}
+
 function updateRoamPose() {
-  if (!model || !app || !roamPoseActive || motionActive || dragPoseActive) {
+  if (!model || !app || !roamPoseActive || dragPoseActive) {
     return;
   }
 
   const { dx, dy, progress, speed, source } = roamPoseDirection;
+  if (motionActive && !MOUSE_FOLLOW_POSE_SOURCES.has(source)) {
+    return;
+  }
+
   const now = performance.now() / 1000;
   const sourceSpeed = source === 'roam'
     ? clamp(speed / 110, 0, 1)
@@ -664,6 +806,7 @@ function setDragPose(pose) {
     motionActive = false;
     resetMotionParameters();
     applyIdleParameters();
+    resetDragPoseSmoothing(Number(pose.clientX) || app.screen.width / 2, Number(pose.clientY) || app.screen.height / 2);
   }
 
   roamPoseActive = false;
@@ -675,7 +818,8 @@ function setDragPose(pose) {
     dx: Number(pose.dx) || 0,
     dy: Number(pose.dy) || 0,
     distance: Number(pose.distance) || 0,
-    durationMs: Number(pose.durationMs) || 0
+    durationMs: Number(pose.durationMs) || 0,
+    updatedAt: performance.now()
   };
 }
 
@@ -685,7 +829,8 @@ function resetDragPose() {
   }
 
   dragPoseActive = false;
-  dragPose = { clientX: 0, clientY: 0, dx: 0, dy: 0, distance: 0, durationMs: 0 };
+  dragPose = { clientX: 0, clientY: 0, dx: 0, dy: 0, distance: 0, durationMs: 0, updatedAt: 0 };
+  resetDragPoseSmoothing();
   for (const [parameterId, value] of DRAG_RESET_PARAMETERS) {
     setParameter(parameterId, value);
   }
@@ -697,37 +842,72 @@ function updateDragPose() {
     return;
   }
 
-  const now = performance.now() / 1000;
-  const speedLength = Math.hypot(dragPose.dx, dragPose.dy);
-  const directionX = speedLength > 0.001 ? dragPose.dx / speedLength : 0;
-  const directionY = speedLength > 0.001 ? dragPose.dy / speedLength : -0.3;
-  const pullX = clamp((dragPose.clientX / Math.max(1, app.screen.width) - 0.5) * 2, -1, 1);
-  const pullY = clamp((dragPose.clientY / Math.max(1, app.screen.height) - 0.5) * 2, -1, 1);
-  const speedPressure = clamp(speedLength / 22 + dragPose.distance / 340, 0, 1);
-  const activity = clamp(0.36 + dragPose.distance / 150 + speedPressure * 0.58, 0.36, 1.28);
-  const phase = clamp(dragPose.durationMs / 520, 0, 1);
+  const rawSpeed = Math.hypot(dragPose.dx, dragPose.dy);
+  const rawPullX = clamp((dragPose.clientX / Math.max(1, app.screen.width) - 0.5) * 2, -1, 1);
+  const rawPullY = clamp((dragPose.clientY / Math.max(1, app.screen.height) - 0.5) * 2, -1, 1);
+  if (!dragPoseSmoothing.initialized) {
+    resetDragPoseSmoothing(dragPose.clientX, dragPose.clientY);
+  }
+
+  dragPoseSmoothing.pullX += (rawPullX - dragPoseSmoothing.pullX) * DRAG_PULL_BLEND;
+  dragPoseSmoothing.pullY += (rawPullY - dragPoseSmoothing.pullY) * DRAG_PULL_BLEND;
+
+  if (rawSpeed > DRAG_DIRECTION_DEADZONE) {
+    const targetDirection = normalizeVector(dragPose.dx, dragPose.dy);
+    const directionBlend = clamp(rawSpeed / 18, DRAG_DIRECTION_BLEND_MIN, DRAG_DIRECTION_BLEND_MAX);
+    const blendedX = dragPoseSmoothing.directionX + (targetDirection.x - dragPoseSmoothing.directionX) * directionBlend;
+    const blendedY = dragPoseSmoothing.directionY + (targetDirection.y - dragPoseSmoothing.directionY) * directionBlend;
+    const blendedLength = Math.hypot(blendedX, blendedY);
+    const blendedScale = blendedLength > 1 ? 1 / blendedLength : 1;
+    dragPoseSmoothing.directionX = blendedX * blendedScale;
+    dragPoseSmoothing.directionY = blendedY * blendedScale;
+  }
+
+  const targetSpeed = rawSpeed;
+  const speedBlend = targetSpeed > dragPoseSmoothing.speed ? DRAG_SPEED_RISE_BLEND : DRAG_SPEED_FALL_BLEND;
+  dragPoseSmoothing.speed += (targetSpeed - dragPoseSmoothing.speed) * speedBlend;
+
+  const effectiveSpeed = dragPoseSmoothing.speed;
+  const directionX = dragPoseSmoothing.directionX;
+  const directionY = dragPoseSmoothing.directionY;
+  const pullX = dragPoseSmoothing.pullX;
+  const pullY = dragPoseSmoothing.pullY;
+  const distancePressure = clamp(dragPose.distance / 260, 0, 1);
+  const speedPressure = clamp(effectiveSpeed / 18, 0, 1);
+  const activity = clamp(0.18 + distancePressure * 0.2 + speedPressure * 0.62, 0.16, 1);
 
   model.focus(
-    app.screen.width * (0.5 + clamp(pullX * 0.26 + directionX * 0.12, -0.38, 0.38)),
-    app.screen.height * (0.5 + clamp(pullY * 0.22 + directionY * 0.10, -0.34, 0.34))
+    app.screen.width * (0.5 + clamp(pullX * 0.18 + directionX * 0.06, -0.28, 0.28)),
+    app.screen.height * (0.5 + clamp(pullY * 0.16 + directionY * 0.05, -0.24, 0.24))
   );
 
-  setParameter('Param7', 1);
+  const dragSmile = clamp(0.64 + distancePressure * 0.12 + speedPressure * 0.58, 0.55, 1.38);
+  const dragNormal = clamp(1.04 - speedPressure * 0.28 - distancePressure * 0.08, 0.72, 1.08);
+  setParameter('Param7', 0);
   setParameter('Param8', 0);
   setParameter('Param9', 0);
-  setParameter('Param10', 0);
-  setParameter('Param11', 1);
-  applyMovementAppendagePose({
+  setParameter('Param10', dragSmile);
+  setParameter('Param11', dragNormal);
+  applyStableDragAppendagePose({
     directionX,
     directionY,
     speedPressure,
     activity,
-    phase,
-    now,
     dragPullX: pullX,
-    dragPullY: pullY,
-    source: 'drag'
+    dragPullY: pullY
   });
+}
+
+function updatePetFrame(ticker) {
+  if (!model) {
+    return;
+  }
+
+  const elapsedMs = Number.isFinite(ticker?.deltaMS) ? ticker.deltaMS : 1000 / 60;
+  model.update(elapsedMs);
+  updateDragPose();
+  updateRoamPose();
+  updateCodexChargeLoopPose();
 }
 
 function normalizeCodexState(state) {
@@ -1045,15 +1225,17 @@ async function start() {
   stageElement.appendChild(app.canvas);
 
   model = await Live2DModel.from(MODEL_URL, {
-    textureOptions: { lod: 'single-auto' }
+    textureOptions: { lod: 'single-auto' },
+    autoUpdate: false,
+    autoFocus: false,
+    autoHitTest: false,
+    autoInteract: false
   });
   configureEyeBlink();
   model.anchor.set(0.5);
   app.stage.addChild(model);
   fitModel();
-  app.ticker.add(updateDragPose);
-  app.ticker.add(updateRoamPose);
-  app.ticker.add(updateCodexChargeLoopPose);
+  app.ticker.add(updatePetFrame, undefined, UPDATE_PRIORITY.NORMAL);
 
   window.addEventListener('resize', fitModel);
   window.desktopPet = {

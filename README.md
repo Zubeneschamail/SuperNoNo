@@ -153,6 +153,37 @@ dotnet build .\SuperNoNo.csproj -c Release
 
 如果构建时看到 WebView2 / WindowsBase 引用版本警告，但最终是 `0 个错误`，通常可以忽略。
 
+## 生成一键安装包
+
+项目内置了一个自包含安装器。开发者在项目根目录运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build-installer.ps1
+```
+
+生成完成后会得到：
+
+```text
+artifacts\SuperNoNoSetup.exe
+```
+
+把这个 `SuperNoNoSetup.exe` 发给用户即可。用户双击后会自动：
+
+- 安装到 `%LOCALAPPDATA%\Programs\SuperNoNo`，无需管理员权限。
+- 创建桌面快捷方式和开始菜单快捷方式。
+- 注册到 Windows `应用和功能`，支持卸载。
+- 安装完成后自动启动 SuperNoNo。
+
+安装器会把 .NET 运行时打进发布包里，普通用户不需要安装 .NET SDK、Node.js 或 npm。SuperNoNo 仍依赖 Microsoft Edge WebView2 Runtime；多数 Windows 10 / Windows 11 系统已内置或随 Edge 安装。
+
+如果需要静默安装，可运行：
+
+```powershell
+.\artifacts\SuperNoNoSetup.exe --silent
+```
+
+卸载可以从 Windows `应用和功能` 中执行，也可以运行开始菜单里的 `卸载 SuperNoNo`。
+
 ## 文件说明
 
 - `SuperNoNo.exe`：主程序。
